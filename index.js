@@ -31,6 +31,9 @@ versionString.writeUInt8(0, 'OpenBuf'.length);
 var u32FromBuffer = function(buffer) {
     return new Uint32Array(buffer.buffer, buffer.byteOffset, buffer.byteLength/4);
 };
+var u8FromBuffer = function(buffer) {
+    return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+};
 
 var serialize = function(object) {
     // 0 -- Root node (NOP -- don't serialize)
@@ -39,6 +42,7 @@ var serialize = function(object) {
     // 3 -- object end
     // 4 -- object reference
     // 5 -- nop
+    // 6 -- Buffer
     var serializedMemo = new Map();
     var graph = {next:null, type:0};
     var current = graph;
@@ -62,19 +66,17 @@ var serialize = function(object) {
     var insertNode = function(node) {
         current.next = node;
         current = node;
-        bufferSize++;
+        bufferSize+=4;
         switch(node.type) {
             case 0:
                 {
                     // Two words for version string
-                    bufferSize+=8;
+                    bufferSize+=4;
                     node.remaining = 2;
                 }
                 break;
             case 1:
                 {
-                    // String
-                    bufferSize+=4+(node.value.length*2);
                     // Each character in JavaScript is 2 bytes
                     // We can encode 4 bytes in 1 word, so divide by 4
                     // to find the word length. We don't try to be fancy
@@ -83,10 +85,9 @@ var serialize = function(object) {
                     // despite saving space. It would have simplified things if JavaScript
                     // just used UTF-8 to begin with....
                     node.remaining = Math.ceil((node.value.length*2)/4);
-                    // Must encode at least 1 word.
-                    node.remaining+=(!node.remaining);
                     // Don't forget the header
                     node.remaining++;
+                    bufferSize+=(node.remaining-1)*4;
                 }
                 break;
                 // TODO: Pack some useful data in here.
@@ -106,6 +107,10 @@ var serialize = function(object) {
                     case 5:
                         node.remaining = 1;
                     break;
+                    case 6:
+                        node.remaining = Math.ceil(node.value.length/4)+1;
+                        bufferSize+=(node.remaining-1)*4;
+                        break;
         }
         return node;
     };
@@ -113,6 +118,9 @@ var serialize = function(object) {
         switch(obj.toString) {
             case ''.toString:
                 return insertNode(makeNode(1, obj));
+            case versionString.toString:
+                // Buffer
+                return insertNode(makeNode(6, u8FromBuffer(obj)));
                 break;
                 default:
                     // Serialize object
@@ -122,19 +130,19 @@ var serialize = function(object) {
                     }
                     // Insert object header
                     var header = insertNode(makeNode(2, null));
+                    serializedMemo.set(obj, header);
                     for(var key in obj) {
                         serializeObject(key);
                         serializeObject(obj[key]);
                     }
                     // End of object
                     insertNode(makeNode(3, null));
-                    serializedMemo.set(obj, header);
         }
     };
     insertNode(makeNode(0, null));
     serializeObject(object);
     var roundedSize = roundToWord(bufferSize);
-    if(roundedSize != wordCount) {
+    if(roundedSize != bufferSize) {
         insertNode(makeNode(5, null));
         bufferSize = roundedSize;
     }
@@ -179,6 +187,25 @@ var serialize = function(object) {
                 break;
             case 4:
                 u32[i] = 4 | (graph.value.wordOffset << 8);
+                break;
+            case 5: // NOP
+                u32[i] = 5;
+                break;
+                case 6:
+                    // Buffer
+                    {
+                        // Little-Endian encoding
+                        var op = 6 | (graph.value.length << 8);
+                        var wx = !!wordIndex*(wordIndex-1);
+                        var word = graph.value[wx *4];
+                        word |= graph.value[(wx *4)+1] << 8;
+                        word |= graph.value[(wx *4)+2] << 16;
+                        word |= graph.value[(wx *4)+3] << 24;
+                        word*= !!wordIndex;
+                        word+=((!wordIndex)*(op));
+                        u32[i] = word;
+                    }
+                    break;
         }
         graph.remaining--;
         wordCount *= !!graph.remaining;
@@ -196,20 +223,29 @@ var deserialize = function(buffer) {
     if(u32[1] != uversion[1]) {
         throw new Error('Unsupported version');
     }
+    var obj_map = new Map();
     var state = 0;
     // String builder array
     var str = [];
     // Object builder
     var obj = null;
-    // Stack of objects
-    var obj_stack = [];
-    // Stack of keys
-    var key_stack = [];
+    // obj, key, substate
+    var stack = [];
+    stack.push({obj:null, key:null, substate:0});
+    var substate = 0;
+    var key = null;
     // Length for dynamically sized objects
     // such as strings and arrays.
     var len = 0;
-    // Substate for returns
-    var substate = 0;
+    var push = function() {
+        stack.push({obj:obj, key:key, substate:substate});
+    };
+    var pop = function() {
+        var stack_obj = stack.pop();
+        obj = stack_obj.obj;
+        key = stack_obj.key;
+        substate = stack_obj.substate;
+    };
     var assign_obj = function(value) {
       state = 1;
       switch(substate) {
@@ -217,16 +253,12 @@ var deserialize = function(buffer) {
               return true;
            case 1:
                // Add key
-               if(!obj_stack.length) {
-                   // End of object stack -- return
-                   return true;
-               }
-               key_stack.push(value);
+               key = value;
                substate = 2;
                return false;
             case 2:
                 // Add value
-                obj[key_stack.pop()] = value;
+                obj[key] = value;
                 substate = 1;
             return false;
       }
@@ -251,26 +283,50 @@ var deserialize = function(buffer) {
                             break;
                             case 2:
                                 {
-                                    // Begin object
+                                    // Begin object (new stack frame)
+                                    push();
                                     obj = {};
-                                    obj_stack.push(obj);
+                                    obj_map[i] = obj;
                                     substate = 1;
                                     state = 1;
                                 }
                                 break;
                             case 3:
                                 {
-                                    // Object end (pop stack)
-                                    obj = obj_stack.pop();
+                                    // Object end (pop stack frame)
+                                    var tmp = obj;
+                                    pop();
                                     state = 1;
-                                    if(assign_obj(obj)) {
-                                        return obj;
+                                    if(assign_obj(tmp)) {
+                                        return tmp;
                                     }
                                 }
                                 break;
+                                case 4:
+                                    {
+                                        // Object reference
+                                        var ptr = word >> 8;
+                                        var obj = obj_map[ptr];
+                                        if(assign_obj(obj)) {
+                                            return obj;
+                                        }
+                                    }
+                                    break;
                             case 5:
                                 {
                                     // NOP -- Continue decoding
+                                }
+                                break;
+                            case 6:
+                                {
+                                    // Buffer (direct map -- no memcpy needed)
+                                    var size = word >> 8;
+                                    var ret = Buffer.from(u32.buffer, u32.byteOffset+((i+1)*4), size);
+                                    len = Math.ceil(size/4);
+                                    if(assign_obj(ret)) {
+                                        return ret;
+                                    }
+                                    state = 3;
                                 }
                                 break;
                         default:
@@ -296,8 +352,18 @@ var deserialize = function(buffer) {
                     }
                 }
                 break;
+                case 3:
+                    {
+                    // Wait for bytes to go by(te)...
+                    len--;
+                    if(len == 0) {
+                        state = 1;
+                    }
+                    break;
+                }
         }
     }
+    return null;
 };
 
 var selftest = function() {
@@ -318,18 +384,71 @@ var selftest = function() {
         }
     }
     var testNest = function(){
-        var basis = {test:{nest:'ed object'}};
+        var basis = {test:{nest:'ed object', test:'2', obj2:{why:{not:'another'}}}};
         var serialized = serialize(basis);
         var deserialized = deserialize(serialized);
         if(JSON.stringify(basis) != JSON.stringify(deserialized)) {
             console.log(JSON.stringify(basis)+'!=' +JSON.stringify(deserialized));
         }
     }
-    //testString();
-    //testObjectStringDictionary();
+    var testCycle = function(){
+        var basis = {i:{}};
+        basis.i.contain = 'myself';
+        basis.i.ptr = basis;
+        var serialized = serialize(basis);
+        var deserialized = deserialize(serialized);
+        // This is something we can't test by JSON serialization
+        // This is an edge-case that's impossible to handle in JSON
+        // so we have to manually compare here
+        if(deserialized.i.ptr != deserialized) {
+            console.log('PTR ERROR');
+        }
+    }
+    var testBlob = function() {
+        var basis = {
+            theblob:Buffer.allocUnsafe(17),
+            str:'test'
+        };
+        for(var i = 0;i<basis.theblob.byteLength;i++) {
+            basis.theblob.writeUInt8(i, i);
+        } 
+        var serialized = serialize(basis);
+        var deserialized = deserialize(serialized);
+        if(deserialized.str != 'test') {
+            console.log('Bad string value in testBlob');
+        }
+        for(var i = 0;i<deserialized.theblob.byteLength;i++) {
+            if(deserialized.theblob[i] != i) {
+                console.log('Bytes got eaten by theblob at index '+i+' got '+deserialized.theblob[i]);
+            }
+        }
+    };
+    var perfTest = function() {
+        var basis = {test:{nest:'ed object', test:'2', obj2:{why:{not:'another'}}}};
+        var start = performance.now();
+        for(var i = 0;i<10000;i++) {
+        var serialized = serialize(basis);
+        var deserialized = deserialize(serialized);
+        }
+        var end = performance.now();
+        var dur0 = end-start;
+        start = performance.now();
+        for(var i = 0;i<10000;i++) {
+            var serialized = serialize(basis);
+            var deserialized = deserialize(serialized);
+        }
+        var end = performance.now();
+        var dur1 = end=start;
+        console.log('JSON '+dur1+', custom '+dur0);
+    };
+    testString();
+    testObjectStringDictionary();
     testNest();
+    testCycle();
+    testBlob();
+    perfTest();
 };
-selftest();
+//selftest();
 
 module.exports = {
     serialize,

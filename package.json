@@ -1,6 +1,6 @@
 {
   "name": "openbuffer",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Open-source data serialization format with the goal of being able to serialize any JavaScript object (quickly) into binary as well as rapid deserialization of JavaScript objects",
   "main": "index.js",
   "scripts": {
